@@ -1,0 +1,674 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>FPSnake</title>
+  <link rel="icon" href="..." />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  
+  <!-- BabylonJS Scripts -->
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <script src="https://cdn.babylonjs.com/gui/babylon.gui.js"></script>
+  <script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+  
+  <style>
+    html, body {
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+    }
+
+    #renderCanvas {
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="renderCanvas"></canvas>
+
+  <!-- FPSnake Game Code -->
+  <script type="module">
+    // #region --- Toon Shader source --------------------------------------------------
+const toonVertex = `
+precision highp float;
+attribute vec3 position; attribute vec3 normal;
+uniform mat4 world; uniform mat4 worldViewProjection;
+varying vec3 vWorldPos; varying vec3 vNormal;
+void main() {
+  vec4 wp = world * vec4(position,1.0);
+  vWorldPos = wp.xyz;
+  vNormal   = normalize(mat3(world)*normal);
+  gl_Position = worldViewProjection * vec4(position,1.0);
+}
+`;
+
+const toonFragment = `
+precision highp float;
+uniform vec3 lightPosition;
+uniform vec3 cameraPosition;
+uniform vec3 baseColor;
+uniform float steps;
+uniform float rimStrength;
+uniform float rimThreshold;
+varying vec3 vWorldPos; varying vec3 vNormal;
+void main() {
+  vec3 L = normalize(lightPosition - vWorldPos);
+  float diff = max(dot(vNormal,L),0.0);
+  float qd = floor(diff*steps)/steps;
+
+  vec3 V = normalize(cameraPosition - vWorldPos);
+  float rim = 1.0 - max(dot(vNormal,V),0.0);
+  rim = smoothstep(rimThreshold,1.0,rim)*rimStrength;
+  float qr = floor(rim*steps)/steps;
+
+  vec3 c = baseColor * qd + vec3(1.0)*qr;
+  gl_FragColor = vec4(c,1.0);
+}
+`;
+
+// register with Babylon
+BABYLON.Effect.ShadersStore["toonVertexShader"]   = toonVertex;
+BABYLON.Effect.ShadersStore["toonFragmentShader"] = toonFragment;
+
+// factory to make a toon material of any color
+function makeToonMat(name, scene, light, camera, color3, steps=3, rimS=1, rimT=0.5) {
+  const m = new BABYLON.ShaderMaterial(name, scene, {
+    vertex:   "toon",   
+    fragment: "toon"
+  }, {
+    attributes: ["position","normal"],
+    uniforms:   ["world","worldViewProjection","lightPosition","cameraPosition","baseColor","steps","rimStrength","rimThreshold"]
+  });
+  m.setVector3("lightPosition", light.position);
+  m.setColor3 ("baseColor",  color3);
+  m.setFloat  ("steps",      steps);
+  m.setFloat  ("rimStrength",rimS);
+  m.setFloat  ("rimThreshold",rimT);
+  // we'll update cameraPosition each frame below
+  return m;
+}
+// #endregion --- End Toon Shader source ------------------------------------------------
+
+//#region Starters
+const canvas = document.getElementById("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true);
+//#endregion
+
+//#region random function
+function getRandom(min, max) {
+  return Math.random() * (max - min) + min;
+}
+//#endregion
+
+const createScene = async function () {
+
+  const backgroundMusic = new Audio("./bgmusic.mp3");
+  backgroundMusic.volume = 0.5; // Set volume to a reasonable level
+  backgroundMusic.loop = true; // Loop the music
+  backgroundMusic.preload = true;
+  backgroundMusic.load();
+  backgroundMusic.play().catch(err => console.error("Background music failed to play:", err));
+
+  const scene = new BABYLON.Scene(engine);
+
+  const deathSound = new Audio("./die.mp3");
+  deathSound.volume = 1; // Set volume to a reasonable level
+  deathSound.loop = false;
+  deathSound.preload = true;
+  deathSound.load();
+
+  function playDeathSound() {
+    deathSound.currentTime = 0; // rewind if already playing
+    deathSound.play().catch(err => console.error("Sound failed to play:", err));
+  }
+
+  //#region start GUI
+
+  // Set the font family for the entire GUI
+  const guiTexture = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI("UI");
+  const startimg = new BABYLON.GUI.Image("startimg", "./strt.png");
+  startimg.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+  startimg.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_CENTER;
+  startimg.width = "80%";
+  startimg.height = "63%";
+
+  const startbutton = BABYLON.GUI.Button.CreateSimpleButton("startbutton", "Start");
+  startbutton.width = "300px";
+  startbutton.height = "100px";
+  startbutton.color = "white";
+
+  startimg.alpha = 1;
+
+  startbutton.background = "#4CAF50"; // Green background
+  startbutton.cornerRadius = 20; // Rounded corners
+  startbutton.fontSize = "35px"; // Larger font size (ensure it's a string with 'px')
+  startbutton.bottom = "-50px"; // Position below the image
+  startbutton.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+  startbutton.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+
+  startbutton.shadowOffsetX = 4; // Add shadow for better visibility
+  startbutton.shadowOffsetY = 4;
+  startbutton.shadowBlur = 10;
+  startbutton.shadowColor = "rgba(0, 0, 0, 0.5)";
+  startbutton.zIndex = 1; // Ensure the button is rendered above the image
+  guiTexture.addControl(startimg); // Add the image first
+  guiTexture.addControl(startbutton); // Then add the button
+
+  var speed = 0;
+
+  startbutton.onPointerClickObservable.add(() => {
+  let countdown = 3;
+  startbutton.textBlock.text = countdown; // Set initial text
+
+  const interval = setInterval(() => {
+    countdown--;
+    if (countdown > 0) {
+      startbutton.textBlock.text = countdown; // Update text
+    } else {
+      clearInterval(interval); // Stop the countdown
+      startbutton.textBlock.text = "Go!"; // Final text
+      setTimeout(() => {
+        speed = 0.00500;
+        guiTexture.removeControl(startbutton);
+        guiTexture.removeControl(startimg);
+      }, 500); // Delay before starting the game
+    }
+  }, 1000); // 1-second interval
+  });
+  //#endregion
+  
+  engine.stopRenderLoop(); // Stop the render loop initially
+  
+  //#region Create a skybox
+
+	var skybox = BABYLON.MeshBuilder.CreateBox("skyBox", {size:1000.0}, scene);
+	var skyboxMaterial = new BABYLON.StandardMaterial("skyBox", scene);
+	skyboxMaterial.backFaceCulling = false;
+	skyboxMaterial.reflectionTexture = new BABYLON.CubeTexture("./SkyMap/skybox", scene);
+	skyboxMaterial.reflectionTexture.coordinatesMode = BABYLON.Texture.SKYBOX_MODE;
+	skyboxMaterial.diffuseColor = new BABYLON.Color3(0, 0, 0);
+	skyboxMaterial.specularColor = new BABYLON.Color3(0, 0, 0);
+	skybox.material = skyboxMaterial;	
+  //#endregion Create a skybox	
+
+  //#region Create a text block for the score
+  // Initialize score variable
+  let score = 0;
+
+  const scoreText = new BABYLON.GUI.TextBlock();
+  scoreText.text = `Score: ${score}`;
+  scoreText.color = "white";
+  scoreText.fontSize = 34;
+  scoreText.top = "-45%";
+  scoreText.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+  scoreText.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+  guiTexture.addControl(scoreText);
+  //#endregion Create a text block for the score
+  
+  const appleEatSound = new Audio("./apple.mp3");
+  appleEatSound.volume = 1; // Set volume to a reasonable level
+  appleEatSound.loop = false;
+  appleEatSound.preload = true;
+  appleEatSound.load();
+  
+  function playAppleSound() {
+    appleEatSound.currentTime = 0; // rewind if already playing
+    appleEatSound.play().catch(err => console.error("Sound failed to play:", err));
+  }
+
+  //#region Function to update the score
+  function updateScore() {
+    score ++;
+    scoreText.text = `Score: ${score}`;
+    if (score > 5){
+      if (Math.random() < 0.30) {
+        const wall = BABYLON.MeshBuilder.CreateBox("wall_na", { size: 0.17 }, scene);
+        wall.scaling.x = getRandom(0.5, 1.5);
+        wall.scaling.z = getRandom(0.5, 1.5);
+        wall.position.x = getRandom(-0.55, 0.55);
+        wall.position.z = getRandom(-0.55, 0.55);
+        wall.position.y = 0.05;
+        wall.material = bricks;
+      }
+    }
+  }
+  //#endregion Function to update the score
+
+  //#region  Create a camera
+
+  const camera = new BABYLON.ArcRotateCamera("ArcCamera", 4.7, 1.45, 0.15, new BABYLON.Vector3(0, 0.05, 0), scene);
+  camera.attachControl(canvas, true);
+  camera.fov = 1.1;
+  camera.lowerRadiusLimit = 0;
+  camera.upperRadiusLimit = 1;
+  camera.minZ = 0.01;
+  camera.wheelDeltaPercentage = 0.01; // Adjust zoom sensitivity
+
+  //#endregion  Create a camera
+
+  //#region Create a light
+  // Key light
+  const keyLight = new BABYLON.DirectionalLight(
+    "keyLight",
+    new BABYLON.Vector3(-1, -2, -1),
+    scene
+  );
+  keyLight.intensity = 2.0;
+
+  // Fill light
+  const fillLight = new BABYLON.DirectionalLight(
+    "fillLight",
+    new BABYLON.Vector3(2, -2, 0),
+    scene
+  );
+  fillLight.intensity = 0.5;
+
+  // Back light
+  const backLight = new BABYLON.DirectionalLight(
+    "backLight",
+    new BABYLON.Vector3(0, -2, 2),
+    scene
+  );
+  backLight.intensity = 0.7;
+  // Ambient light
+  const ambientLight = new BABYLON.HemisphericLight("ambientLight", new BABYLON.Vector3(0, 1, 0), scene);
+  ambientLight.intensity = 0.3;
+
+  // shader
+  const toonGreen = makeToonMat("toonGreen", scene, keyLight, camera,
+    new BABYLON.Color3(0.431,0.878,0.486));
+
+  //#endregion Create a light
+
+  //#region Load outwalls
+
+  const bricks = new BABYLON.StandardMaterial("bricks", scene);
+  bricks.diffuseTexture = new BABYLON.Texture("./Bricks.jpg", scene);
+
+  bricks.diffuseTexture.wrapU = BABYLON.Texture.WRAP_ADDRESSMODE;
+  bricks.diffuseTexture.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
+
+  bricks.diffuseTexture.uScale = 8;
+  bricks.diffuseTexture.vScale = 1;
+
+  const bricksZ = bricks.clone("bricksZ");
+  bricksZ.diffuseTexture.wAng = Math.PI / 2;
+  bricksZ.diffuseTexture.uScale = 1;
+  bricksZ.diffuseTexture.vScale = 8;
+
+  const wall1 = BABYLON.MeshBuilder.CreateBox("wall1_na", { size: 0.17 }, scene);
+  wall1.scaling.x = 8;
+  wall1.position.z = 0.65;
+  wall1.position.y = 0.05;
+  wall1.material = bricks;
+
+  const wall2 = BABYLON.MeshBuilder.CreateBox("wall2_na", { size: 0.17 }, scene);
+  wall2.scaling.x = 8;
+  wall2.position.z = -0.65;
+  wall2.position.y = 0.05;
+  wall2.material = bricks;
+
+  const wall3 = BABYLON.MeshBuilder.CreateBox("wall3_na", { size: 0.17 }, scene);
+  wall3.scaling.z = 8;
+  wall3.position.x = 0.65;
+  wall3.position.y = 0.05;
+  wall3.material = bricksZ;
+
+  const wall4 = BABYLON.MeshBuilder.CreateBox("wall4_na", { size: 0.17 }, scene);
+  wall4.scaling.z = 8;
+  wall4.position.x = -0.65;
+  wall4.position.y = 0.05;
+  wall4.material = bricksZ;
+
+  //#endregion Load outwalls
+
+  //#region Create ground
+
+  const ground = BABYLON.MeshBuilder.CreateGround(
+    "ground",
+    { width: 1.25, height: 1.25 },
+    scene
+  );
+  const groundMaterial = new BABYLON.StandardMaterial("groundMaterial", scene);
+  groundMaterial.diffuseTexture = new BABYLON.Texture("./grass.jpg", scene);
+  groundMaterial.diffuseTexture.uScale = 15;
+  groundMaterial.diffuseTexture.vScale = 15;
+  groundMaterial.specularColor = new BABYLON.Color3(0, 0, 0);
+  groundMaterial.specularPower = 0;
+  ground.material = groundMaterial;
+  //#endregion Create ground
+
+  //#region Create player
+  const player = BABYLON.MeshBuilder.CreateSphere(
+    "player_na",
+    { diameter: 0.05 },
+    scene
+  );
+  const eye = BABYLON.MeshBuilder.CreateSphere(
+    "eye_na",
+    { diameter: 0.01 },
+    scene
+  );
+  const eye2 = BABYLON.MeshBuilder.CreateSphere(
+    "eye2_na",
+    { diameter: 0.01 },
+    scene
+  );
+  eye.position.x = 0.013;
+  eye2.position.x = -0.013;
+  eye.position.y = 0.015;
+  eye2.position.y = 0.015;
+  eye.position.z = 0.02;
+  eye2.position.z = 0.02;
+  eye.parent = player;
+  eye2.parent = player;
+  //Create ray
+  const ray = new BABYLON.Ray(player.position, player.forward, 0.012);
+  const hit = scene.pickWithRay(ray);
+  ray.parent = player;
+  // Player position
+  player.position.y = 0.035;
+  //player material
+  player.material = toonGreen;
+
+
+  const eyeMaterial = new BABYLON.StandardMaterial("eyeMaterial", scene);
+  eyeMaterial.diffuseColor = new BABYLON.Color3(0, 0, 0);
+  eye.material = eyeMaterial;
+  eye2.material = eyeMaterial;
+
+  //camera stuff
+  camera.parent = player;
+  //#endregion Create player
+
+  //#region Input handling + movement
+  const inputMap = {};
+  scene.actionManager = new BABYLON.ActionManager(scene);
+
+  scene.actionManager.registerAction(
+    new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnKeyDownTrigger, (evt) => {
+      inputMap[evt.sourceEvent.key] = true;
+    })
+  );
+  scene.actionManager.registerAction(
+    new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnKeyUpTrigger, (evt) => {
+      inputMap[evt.sourceEvent.key] = false;
+    })
+  );
+
+  // Player movement
+  scene.onBeforeRenderObservable.add(() => {
+    const rotationSpeed = 0.1;
+    if (inputMap["a"]) {
+      player.rotation.y = BABYLON.Scalar.Lerp(player.rotation.y, player.rotation.y - rotationSpeed, 0.5);
+    }
+    if (inputMap["d"]) {
+      player.rotation.y = BABYLON.Scalar.Lerp(player.rotation.y, player.rotation.y + rotationSpeed, 0.5);
+    }
+  });
+  //#endregion Input handling
+
+  // #region player movement
+  scene.onBeforeRenderObservable.add(() => {
+    
+    const forward = player.forward;
+    player.position.addInPlace(forward.scale(speed));
+  });
+  //#endregion
+  //#region Apple spawn
+  let appleRoot = null;
+
+  // spawns one apple and returns its import result
+  async function appleSpawn() {
+    if(!appleRoot) {
+      const result = await BABYLON.ImportMeshAsync("./low_poly_apple.glb", scene);
+      appleRoot = result.meshes[0];
+      appleRoot.scaling.set(0.03, 0.03, 0.03);
+      appleRoot.position.set(getRandom(-0.45, 0.45), 0.03, getRandom(-0.45, 0.45));
+      return appleRoot;
+    }
+    else {
+      appleRoot.scaling.set(0.03, 0.03, 0.03);
+      appleRoot.position.set(getRandom(-0.45, 0.45), 0.03, getRandom(-0.45, 0.45));
+      return appleRoot;
+    }
+  }
+
+  let spawningApple = false;
+
+  async function createApple() {
+    if (spawningApple) return;
+    spawningApple = true;
+  
+    appleRoot = await appleSpawn();
+  
+    const meshes = scene.meshes.filter(mesh => mesh.name.endsWith("_na"));
+    for (const mesh of meshes) {
+      if (appleRoot.intersectsMesh(mesh, false)) {
+        appleRoot.dispose();  // kill the bad one
+        spawningApple = false;
+        return await createApple(); // retry
+      }
+    }
+  
+    spawningApple = false;
+  }
+  
+
+
+
+  //#endregion Apple spawn
+  
+  // draw your ray helper (optional)
+  BABYLON.RayHelper.CreateAndShow(ray, scene, new BABYLON.Color3(1, 1, 0.1));
+  
+  //#region Game Over
+  function gameOver() {
+    const gameOverText = new BABYLON.GUI.TextBlock();
+    gameOverText.text = "Game Over!";
+    gameOverText.color = "white";
+    gameOverText.fontSize = 100;
+    gameOverText.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+    gameOverText.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_CENTER;
+    guiTexture.addControl(gameOverText);
+    const finalScoreText = new BABYLON.GUI.TextBlock();
+    playDeathSound();
+    backgroundMusic.volume = 0.1; 
+    guiTexture.addControl(finalScoreText);
+    speed = 0;
+    const targetBeta = 0;
+    scene.onBeforeRenderObservable.add(() => {
+      camera.beta = BABYLON.Scalar.Lerp(camera.beta, targetBeta, 0.005);
+      camera.radius = BABYLON.Scalar.Lerp(camera.radius, camera.radius + 0.03, 0.005);
+    });
+    let index = snakes.length - 1; // start from the last segment
+    const interval = setInterval(() => {
+      if (index >= 0) {
+        snakes[index].dispose();
+        index--;
+      } else {
+        clearInterval(interval); // Stop the interval when done
+        engine.stopRenderLoop();  // THEN stop the game loop
+      }
+    }, 50);
+    const restartButton = BABYLON.GUI.Button.CreateSimpleButton("restartButton", "Restart");
+    restartButton.width = "200px";
+    restartButton.height = "60px";
+    restartButton.color = "white";
+    restartButton.background = "#FF6347"; // Tomato color for better visibility
+    restartButton.cornerRadius = 15; // Rounded corners for a modern look
+    restartButton.fontSize = "22px"; // Slightly larger font size for readability
+    restartButton.paddingLeft = "10px";
+    restartButton.paddingRight = "10px";
+    restartButton.paddingTop = "5px";
+    restartButton.paddingBottom = "5px";
+    restartButton.shadowOffsetX = 5; // Add shadow for depth
+    restartButton.shadowOffsetY = 5;
+    restartButton.shadowBlur = 32;
+    restartButton.shadowColor = "rgba(0, 0, 0, 0.005)";
+    restartButton.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_CENTER;
+    restartButton.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+    restartButton.top = "100px"; // Position below the "Game Over" text
+    guiTexture.addControl(restartButton);
+
+    restartButton.onPointerClickObservable.add(() => {
+      location.reload(); // Reload the page to restart the game
+    });
+  }
+  
+  //#endregion Game Over
+
+  //#region snake body
+  const snakes = []; // Only for body segments
+  const trail = [];
+
+  const segmentCount = 8;
+  const distanceThreshold = 0.035;
+  let lastTrailPosition = player.position.clone();
+
+  // Create snake body (do NOT include player here)
+for (let i = 0; i < segmentCount; i++) {
+  const seg = BABYLON.MeshBuilder.CreateSphere("seg", { diameter: 0.05 }, scene);
+  snakes.push(seg);
+
+  if (i === 0) {
+    // First segment is positioned behind the player
+    seg.position = player.position.clone().add(player.forward.scale(-distanceThreshold));
+  } else {
+    // Each subsequent segment follows the previous one, at a fixed distance
+    const lastSegment = snakes[snakes.length - 2]; // Get the previous segment
+    const direction = lastSegment.position.subtract(snakes[snakes.length - 1].position).normalize().scale(distanceThreshold);
+    seg.position = lastSegment.position.clone().addInPlace(direction);
+  }
+  seg.material = toonGreen;
+  seg.position.y = 0.03;
+}
+
+
+  scene.onBeforeRenderObservable.add(() => {
+    const movementSinceLast = BABYLON.Vector3.Distance(player.position, lastTrailPosition);
+
+    if (movementSinceLast >= distanceThreshold) {
+      trail.unshift(player.position.clone());
+      lastTrailPosition.copyFrom(player.position);
+
+      if (trail.length > segmentCount) {
+        trail.pop();
+      }
+    }
+
+    for (let i = 0; i < snakes.length; i++) {
+      if (trail[i]) {
+        // FIRST LERP: move halfway to the trail point
+        snakes[i].position = BABYLON.Vector3.Lerp(
+          snakes[i].position,
+          trail[i],
+          0.19
+        );
+        if (i > 0) {
+          snakes[i].position = BABYLON.Vector3.Lerp(
+            snakes[i].position,
+            snakes[i - 1].position,
+            0.19
+          );
+        }
+      }
+    }
+  });
+  //#endregion
+  
+  //#region More apple stuff and detection
+  scene.onBeforeRenderObservable.add(() => {
+    // nothing to do until apple exists
+    if (!appleRoot) return;
+
+    // update ray origin + direction every frame
+    ray.origin.copyFrom(player.position);
+    ray.direction.copyFrom(player.forward);
+
+    // do the pick
+    const pick = scene.pickWithRay(ray);
+    // debug line: console.log(pick.hit, pick.pickedMesh?.name);
+
+    // if the ray hit any part of our apple
+    if (pick.hit && pick.pickedMesh &&
+       (pick.pickedMesh === appleRoot || pick.pickedMesh.isDescendantOf(appleRoot))) {
+       
+      const seg = BABYLON.MeshBuilder.CreateSphere(
+        "seg_na",
+        { diameter: 0.05 },
+        scene
+      );
+      seg.material = toonGreen;
+
+      // Position the new segment at the last trail position or the last snake segment
+      const lastPosition = trail.length > 0 ? trail[trail.length - 1] : player.position.clone();
+      seg.position.copyFrom(lastPosition);
+
+      snakes.push(seg);
+      trail.push(player.position.clone());
+      updateScore();
+      playAppleSound();
+      createApple();
+      console.log("🍎 eaten");
+      return;
+    }
+
+    for (let i = 0; i < snakes.length; i++) {
+      if (snakes[i].intersectsMesh(appleRoot, false)) {
+        createApple();
+      }
+    }
+    for (let i = 0; i < snakes.length; i++) {
+      if (pick.hit && pick.pickedMesh &&
+        (pick.pickedMesh === snakes[i] || pick.pickedMesh.isDescendantOf(player))) {
+        gameOver();
+        console.log("Game Over");
+      }
+    }
+      if (pick.hit && pick.pickedMesh &&
+        (pick.pickedMesh.name.startsWith("wall"))) {
+        //gameOver();
+        console.log("Game Over");
+      }
+      const walls = scene.meshes.filter(mesh => mesh.name.startsWith("wall"));
+      for (const wall of walls) {
+        if (player.intersectsMesh(wall, true)) {
+          gameOver();
+          console.log("Game Over");
+          break;
+        }
+      }
+      for (const wall of walls) {
+        if (appleRoot.intersectsMesh(wall, false)) {
+          console.log("Apple in wall");
+          appleRoot.dispose();  // kill the bad one
+          createApple(); // re-call only after disposing
+          return;
+        }
+      }
+  });
+  //#endregion
+  createApple();
+  return scene;
+};
+
+const scene = await createScene();
+
+//#region Render loop
+engine.runRenderLoop(function () {
+  scene.render();
+});
+
+window.addEventListener("resize", function () {
+  engine.resize();
+});
+//#endregion
+
+  </script>
+</body>
+</html>
